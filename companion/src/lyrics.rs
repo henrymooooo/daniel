@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -574,6 +574,17 @@ struct FetchedLyrics {
     raw_lrc: Option<String>,
 }
 
+fn build_http_agent() -> Result<ureq::Agent, String> {
+    let tls = ureq::native_tls::TlsConnector::new()
+        .map_err(|e| format!("Failed to initialize Windows TLS connector: {e}"))?;
+    Ok(ureq::AgentBuilder::new()
+        .tls_connector(Arc::new(tls))
+        .timeout_connect(Duration::from_secs(4))
+        .timeout_read(Duration::from_secs(6))
+        .user_agent(USER_AGENT)
+        .build())
+}
+
 fn fetch_from_lrclib(
     agent: &ureq::Agent,
     title: &str,
@@ -591,20 +602,19 @@ fn fetch_from_lrclib(
     }
 
     let mut fallback_plain: Option<Vec<String>> = None;
+    let album_trimmed = album.trim();
 
-    if !title_trimmed.is_empty() && !artist_trimmed.is_empty() {
-        let mut req = agent
+    if !title_trimmed.is_empty()
+        && !artist_trimmed.is_empty()
+        && !album_trimmed.is_empty()
+        && let Some(dur) = duration_secs.filter(|&d| d > 0)
+    {
+        let req = agent
             .get(LRCLIB_GET_URL)
             .query("track_name", title_trimmed)
-            .query("artist_name", artist_trimmed);
-
-        let album_trimmed = album.trim();
-        if !album_trimmed.is_empty() {
-            req = req.query("album_name", album_trimmed);
-        }
-        if let Some(dur) = duration_secs.filter(|&d| d > 0) {
-            req = req.query("duration", &dur.to_string());
-        }
+            .query("artist_name", artist_trimmed)
+            .query("album_name", album_trimmed)
+            .query("duration", &dur.to_string());
 
         match req.call() {
             Ok(resp) => {
@@ -624,7 +634,7 @@ fn fetch_from_lrclib(
                     LyricsContent::NotFound => {}
                 }
             }
-            Err(ureq::Error::Status(404, _)) => {}
+            Err(ureq::Error::Status(400 | 404, _)) => {}
             Err(ureq::Error::Status(code, _)) => {
                 return Err(format!("LRCLIB HTTP {code}"));
             }
@@ -730,12 +740,7 @@ impl LyricsWorker {
         thread::Builder::new()
             .name("lrclib-worker".to_string())
             .spawn(move || {
-                let agent = ureq::AgentBuilder::new()
-                    .timeout_connect(Duration::from_secs(4))
-                    .timeout_read(Duration::from_secs(6))
-                    .user_agent(USER_AGENT)
-                    .build();
-
+                let agent_result = build_http_agent();
                 let mut mem_cache: HashMap<String, LyricsContent> = HashMap::new();
 
                 while let Ok(mut req) = req_rx.recv() {
@@ -771,28 +776,31 @@ impl LyricsWorker {
                         continue;
                     }
 
-                    let state = match fetch_from_lrclib(
-                        &agent,
-                        &req.title,
-                        &req.artist,
-                        &req.album,
-                        req.duration_secs,
-                    ) {
-                        Ok(fetched) => {
-                            cache.save(
-                                &req.artist,
-                                &req.title,
-                                req.duration_secs,
-                                &fetched.content,
-                                fetched.raw_lrc.as_deref(),
-                            );
-                            mem_cache.insert(key, fetched.content.clone());
-                            LyricsState::Ready {
-                                content: fetched.content,
-                                source: LyricsSource::Network,
+                    let state = match &agent_result {
+                        Ok(agent) => match fetch_from_lrclib(
+                            agent,
+                            &req.title,
+                            &req.artist,
+                            &req.album,
+                            req.duration_secs,
+                        ) {
+                            Ok(fetched) => {
+                                cache.save(
+                                    &req.artist,
+                                    &req.title,
+                                    req.duration_secs,
+                                    &fetched.content,
+                                    fetched.raw_lrc.as_deref(),
+                                );
+                                mem_cache.insert(key, fetched.content.clone());
+                                LyricsState::Ready {
+                                    content: fetched.content,
+                                    source: LyricsSource::Network,
+                                }
                             }
-                        }
-                        Err(err) => LyricsState::Error(err),
+                            Err(err) => LyricsState::Error(err),
+                        },
+                        Err(tls_err) => LyricsState::Error(tls_err.clone()),
                     };
 
                     let _ = resp_tx.send(LyricsResponse {
@@ -1027,5 +1035,10 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builds_native_tls_http_agent() {
+        assert!(build_http_agent().is_ok());
     }
 }
