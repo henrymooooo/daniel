@@ -41,8 +41,8 @@ All 8 signal lines use the XIAO ESP32-C3's 8 non-strapping GPIOs, leaving the bo
 
 ### Phase 0: Windows companion app (Rust, built on PC while parts ship)
 
-- Milestone 0.1 (current): Windows SMTC (`Windows.Media.Control`) media reader, playback timestamp interpolation, and live terminal dashboard.
-- Milestone 0.2: LRCLIB (`lrclib.net`) `.lrc` synced lyrics fetcher, parser, local cache, and `128×64` OLED layout preview.
+- Milestone 0.1 (done): Windows SMTC (`Windows.Media.Control`) media reader, playback timestamp interpolation, and live terminal dashboard.
+- Milestone 0.2 (current): LRCLIB (`lrclib.net`) `.lrc` synced lyrics fetcher, parser, local cache, and `128×64` OLED layout preview.
 - Milestone 0.3: Media controls (Prev, Play/Pause, Next) and per-app WASAPI volume control for the active media app.
 - Milestone 0.4: BLE GATT service protocol and mock transport layer for the ESP32-C3.
 
@@ -58,16 +58,16 @@ Connect the XIAO ESP32-C3 to the Windows companion app over BLE to stream track 
 
 Solder the 3 Outemu Brown switches and the 2000mAh LiPo (`BAT+`/`BAT-`), then turn on OLED timeout and ESP32 light/deep sleep.
 
-## Quick start (Milestone 0.1)
+## Quick start
 
-Start Spotify, YouTube, or another media app on Windows 11, then run:
+Start Spotify, spotifast, YouTube, or another media app on Windows 11, then run:
 
 ```powershell
 cargo run --manifest-path companion/Cargo.toml
 ```
 
-For a single snapshot check:
+Optional flags:
 
-```powershell
-cargo run --manifest-path companion/Cargo.toml -- --once
-```
+- `--once`: prints one SMTC snapshot and exits.
+- `--offset-ms 250`: shifts lyric timing in milliseconds (positive values show lines earlier).
+- `--no-cache`: bypasses the local disk cache and queries `lrclib.net` directly.
