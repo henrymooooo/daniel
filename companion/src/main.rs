@@ -4,6 +4,9 @@ mod input;
 mod lyrics;
 mod media;
 mod oled_preview;
+mod protocol;
+mod simulator;
+mod transport;
 
 use std::collections::VecDeque;
 use std::env;
@@ -21,6 +24,11 @@ use lyrics::{
 };
 use media::{MediaCommand, MediaSnapshot, PlaybackStatus, SmtcReader, TrackId};
 use oled_preview::{OledLyricStatus, OledVolumeInfo, render_oled_box};
+use protocol::{
+    DeviceButton, DeviceEvent, HostPacket, LyricDisplayMode, PowerMode, ProtocolSyncState,
+};
+use simulator::{DEFAULT_SIMULATOR_PORT, SimulatorTransport};
+use transport::{DeviceTransport, NoopTransport, TransportStats};
 
 const INPUT_TICK: Duration = Duration::from_millis(50);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -40,6 +48,8 @@ struct CliOptions {
     once: bool,
     no_cache: bool,
     offset_ms: i64,
+    simulate: bool,
+    port: u16,
     help: bool,
 }
 
@@ -51,6 +61,8 @@ where
         once: false,
         no_cache: false,
         offset_ms: 0,
+        simulate: false,
+        port: DEFAULT_SIMULATOR_PORT,
         help: false,
     };
 
@@ -60,6 +72,7 @@ where
             "--help" | "-h" => opts.help = true,
             "--once" => opts.once = true,
             "--no-cache" => opts.no_cache = true,
+            "--simulate" => opts.simulate = true,
             "--offset-ms" => {
                 let val = iter.next().ok_or_else(|| {
                     "--offset-ms requires an integer value (e.g. --offset-ms 250)".to_string()
@@ -74,6 +87,16 @@ where
                     format!("invalid --offset-ms value '{val}' (expected integer ms)")
                 })?;
             }
+            "--port" => {
+                let val = iter.next().ok_or_else(|| {
+                    "--port requires a port number (e.g. --port 47291)".to_string()
+                })?;
+                opts.port = parse_port(&val)?;
+            }
+            other if other.starts_with("--port=") => {
+                let val = &other["--port=".len()..];
+                opts.port = parse_port(val)?;
+            }
             other => {
                 return Err(format!(
                     "unknown argument '{other}'. Run with --help for usage."
@@ -85,9 +108,24 @@ where
     Ok(opts)
 }
 
+fn parse_port(val: &str) -> Result<u16, String> {
+    let p = val
+        .parse::<u16>()
+        .map_err(|_| format!("invalid --port value '{val}' (expected 1..=65535)"))?;
+    if p == 0 {
+        return Err("invalid --port value '0' (expected 1..=65535)".to_string());
+    }
+    Ok(p)
+}
+
 fn print_usage() {
-    println!("Desk Media Companion — Phase 0 (Milestone 0.3: Controls + Per-App Volume)");
+    println!("Desk Media Companion — Phase 0 (Milestone 0.4: BLE Protocol & Digital Sim)");
     println!("Usage: desk-media-companion [OPTIONS]");
+    println!("  --simulate           Launch the 128x64 pixel web simulator on 127.0.0.1.");
+    println!(
+        "  --port <PORT>        Simulator HTTP port (default: {}).",
+        DEFAULT_SIMULATOR_PORT
+    );
     println!("  --once               Poll Windows SMTC once, print snapshot, and exit.");
     println!("  --offset-ms <MS>     Shift lyric timing in ms (positive = show lyrics earlier).");
     println!("  --no-cache           Disable local disk cache and always query lrclib.net.");
@@ -139,22 +177,142 @@ fn main() {
     run_live_dashboard(&mut reader, &opts);
 }
 
+struct DashboardState {
+    started: Instant,
+    last_track: Option<TrackId>,
+    last_snap: Option<MediaSnapshot>,
+    last_poll_err: Option<String>,
+    recent_tracks: VecDeque<TrackEvent>,
+    current_lyrics: LyricsState,
+    current_volume: Option<AppVolumeState>,
+    volume_overlay_until: Option<Instant>,
+    had_overlay: bool,
+    last_action_msg: Option<(Duration, String)>,
+    force_refresh: bool,
+    needs_redraw: bool,
+}
+
+impl DashboardState {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last_track: None,
+            last_snap: None,
+            last_poll_err: None,
+            recent_tracks: VecDeque::with_capacity(MAX_RECENT_TRACKS),
+            current_lyrics: LyricsState::Idle,
+            current_volume: None,
+            volume_overlay_until: None,
+            had_overlay: false,
+            last_action_msg: None,
+            force_refresh: true,
+            needs_redraw: true,
+        }
+    }
+
+    fn apply_action(
+        &mut self,
+        action: InputAction,
+        reader: &SmtcReader,
+        audio: &AppAudioController,
+        source_tag: &str,
+    ) -> bool {
+        match action {
+            InputAction::Quit => return true,
+            InputAction::Prev => {
+                let msg = send_media_action(reader, MediaCommand::Prev, "Prev");
+                self.last_action_msg = Some((self.started.elapsed(), format!("{source_tag}{msg}")));
+                self.force_refresh = true;
+                self.needs_redraw = true;
+            }
+            InputAction::PlayPause => {
+                let msg = send_media_action(reader, MediaCommand::PlayPause, "Play/Pause");
+                self.last_action_msg = Some((self.started.elapsed(), format!("{source_tag}{msg}")));
+                self.force_refresh = true;
+                self.needs_redraw = true;
+            }
+            InputAction::Next => {
+                let msg = send_media_action(reader, MediaCommand::Next, "Next");
+                self.last_action_msg = Some((self.started.elapsed(), format!("{source_tag}{msg}")));
+                self.force_refresh = true;
+                self.needs_redraw = true;
+            }
+            InputAction::VolumeDelta(steps) => {
+                let msg = if let Some(snap) = &self.last_snap {
+                    let app_label = friendly_app_name(&snap.app_id);
+                    match audio.adjust_app_volume(&snap.app_id, steps, DEFAULT_VOLUME_STEP) {
+                        Ok(Some(vol)) => {
+                            self.current_volume = Some(vol);
+                            self.volume_overlay_until =
+                                Some(Instant::now() + VOLUME_OVERLAY_TTL);
+                            format!(
+                                "Vol {} {} ({}%{})",
+                                app_label,
+                                if steps >= 0 { "+" } else { "-" },
+                                vol.percent,
+                                if vol.muted { ", MUTED" } else { "" }
+                            )
+                        }
+                        Ok(None) => format!("No WASAPI audio session found for {app_label}"),
+                        Err(err) => format!("Volume error for {app_label}: {err}"),
+                    }
+                } else {
+                    "Volume ignored: no active media session".to_string()
+                };
+                self.last_action_msg = Some((self.started.elapsed(), format!("{source_tag}{msg}")));
+                self.needs_redraw = true;
+            }
+            InputAction::ToggleMute => {
+                let msg = if let Some(snap) = &self.last_snap {
+                    let app_label = friendly_app_name(&snap.app_id);
+                    match audio.toggle_app_mute(&snap.app_id) {
+                        Ok(Some(vol)) => {
+                            self.current_volume = Some(vol);
+                            self.volume_overlay_until =
+                                Some(Instant::now() + VOLUME_OVERLAY_TTL);
+                            format!(
+                                "{} {} ({}%)",
+                                app_label,
+                                if vol.muted { "MUTED" } else { "UNMUTED" },
+                                vol.percent
+                            )
+                        }
+                        Ok(None) => format!("No WASAPI audio session found for {app_label}"),
+                        Err(err) => format!("Mute error for {app_label}: {err}"),
+                    }
+                } else {
+                    "Mute ignored: no active media session".to_string()
+                };
+                self.last_action_msg = Some((self.started.elapsed(), format!("{source_tag}{msg}")));
+                self.needs_redraw = true;
+            }
+        }
+        false
+    }
+}
+
 fn run_live_dashboard(reader: &mut SmtcReader, opts: &CliOptions) {
-    let started = Instant::now();
-    let mut last_track: Option<TrackId> = None;
-    let mut last_snap: Option<MediaSnapshot> = None;
-    let mut last_poll_err: Option<String> = None;
-    let mut recent_tracks: VecDeque<TrackEvent> = VecDeque::with_capacity(MAX_RECENT_TRACKS);
-    let mut current_lyrics = LyricsState::Idle;
-    let mut current_volume: Option<AppVolumeState> = None;
-    let mut volume_overlay_until: Option<Instant> = None;
-    let mut had_overlay = false;
-    let mut last_action_msg: Option<(Duration, String)> = None;
+    let mut transport: Box<dyn DeviceTransport> = if opts.simulate {
+        match SimulatorTransport::start(opts.port) {
+            Ok(sim) => Box::new(sim),
+            Err(err) => {
+                eprintln!("{err}");
+                process::exit(1);
+            }
+        }
+    } else {
+        Box::new(NoopTransport)
+    };
 
     let cache = LyricsCache::new(LyricsCache::default_dir(), !opts.no_cache);
     let worker = LyricsWorker::spawn(cache);
     let audio = AppAudioController;
     let console_input = ConsoleInput::new();
+
+    let mut state = DashboardState::new();
+    let mut sync_state = ProtocolSyncState::default();
+    let mut stats = TransportStats::default();
+    let mut was_connected = false;
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
@@ -162,119 +320,95 @@ fn run_live_dashboard(reader: &mut SmtcReader, opts: &CliOptions) {
     let _ = out.flush();
 
     let mut last_poll = Instant::now();
-    let mut force_refresh = true;
 
     loop {
-        let mut needs_redraw = false;
+        state.needs_redraw = false;
 
         for action in console_input.poll_actions() {
-            match action {
-                InputAction::Quit => return,
-                InputAction::Prev => {
-                    let msg = send_media_action(reader, MediaCommand::Prev, "Prev");
-                    last_action_msg = Some((started.elapsed(), msg));
-                    force_refresh = true;
-                    needs_redraw = true;
-                }
-                InputAction::PlayPause => {
-                    let msg = send_media_action(reader, MediaCommand::PlayPause, "Play/Pause");
-                    last_action_msg = Some((started.elapsed(), msg));
-                    force_refresh = true;
-                    needs_redraw = true;
-                }
-                InputAction::Next => {
-                    let msg = send_media_action(reader, MediaCommand::Next, "Next");
-                    last_action_msg = Some((started.elapsed(), msg));
-                    force_refresh = true;
-                    needs_redraw = true;
-                }
-                InputAction::VolumeDelta(steps) => {
-                    if let Some(snap) = &last_snap {
-                        let app_label = friendly_app_name(&snap.app_id);
-                        let msg = match audio.adjust_app_volume(
-                            &snap.app_id,
-                            steps,
-                            DEFAULT_VOLUME_STEP,
-                        ) {
-                            Ok(Some(vol)) => {
-                                current_volume = Some(vol);
-                                volume_overlay_until =
-                                    Some(Instant::now() + VOLUME_OVERLAY_TTL);
-                                format!(
-                                    "Vol {} {} ({}%{})",
-                                    app_label,
-                                    if steps >= 0 { "+" } else { "-" },
-                                    vol.percent,
-                                    if vol.muted { ", MUTED" } else { "" }
-                                )
-                            }
-                            Ok(None) => format!("No WASAPI audio session found for {app_label}"),
-                            Err(err) => format!("Volume error for {app_label}: {err}"),
-                        };
-                        last_action_msg = Some((started.elapsed(), msg));
-                    } else {
-                        last_action_msg = Some((
-                            started.elapsed(),
-                            "Volume ignored: no active media session".to_string(),
-                        ));
+            if state.apply_action(action, reader, &audio, "") {
+                return;
+            }
+        }
+
+        for raw in transport.poll_events() {
+            stats.rx_packets += 1;
+            stats.rx_bytes += raw.len() as u64;
+            match DeviceEvent::decode(&raw) {
+                Ok(ev) => {
+                    stats.last_rx_summary = Some(ev.summary());
+                    match ev {
+                        DeviceEvent::Button(DeviceButton::Prev) => {
+                            let _ = state.apply_action(InputAction::Prev, reader, &audio, "[BLE] ");
+                        }
+                        DeviceEvent::Button(DeviceButton::PlayPause) => {
+                            let _ = state.apply_action(
+                                InputAction::PlayPause,
+                                reader,
+                                &audio,
+                                "[BLE] ",
+                            );
+                        }
+                        DeviceEvent::Button(DeviceButton::Next) => {
+                            let _ = state.apply_action(InputAction::Next, reader, &audio, "[BLE] ");
+                        }
+                        DeviceEvent::Button(DeviceButton::EncoderClick) => {
+                            let _ = state.apply_action(
+                                InputAction::ToggleMute,
+                                reader,
+                                &audio,
+                                "[BLE] ",
+                            );
+                        }
+                        DeviceEvent::EncoderDelta(delta) => {
+                            let _ = state.apply_action(
+                                InputAction::VolumeDelta(delta as i32),
+                                reader,
+                                &audio,
+                                "[BLE] ",
+                            );
+                        }
+                        DeviceEvent::Hello { .. } => {
+                            sync_state.reset();
+                            state.last_action_msg = Some((
+                                state.started.elapsed(),
+                                format!("[BLE] {} -> full resync", ev.summary()),
+                            ));
+                            state.needs_redraw = true;
+                        }
                     }
-                    needs_redraw = true;
                 }
-                InputAction::ToggleMute => {
-                    if let Some(snap) = &last_snap {
-                        let app_label = friendly_app_name(&snap.app_id);
-                        let msg = match audio.toggle_app_mute(&snap.app_id) {
-                            Ok(Some(vol)) => {
-                                current_volume = Some(vol);
-                                volume_overlay_until =
-                                    Some(Instant::now() + VOLUME_OVERLAY_TTL);
-                                format!(
-                                    "{} {} ({}%)",
-                                    app_label,
-                                    if vol.muted { "MUTED" } else { "UNMUTED" },
-                                    vol.percent
-                                )
-                            }
-                            Ok(None) => format!("No WASAPI audio session found for {app_label}"),
-                            Err(err) => format!("Mute error for {app_label}: {err}"),
-                        };
-                        last_action_msg = Some((started.elapsed(), msg));
-                    } else {
-                        last_action_msg = Some((
-                            started.elapsed(),
-                            "Mute ignored: no active media session".to_string(),
-                        ));
-                    }
-                    needs_redraw = true;
+                Err(err) => {
+                    stats.last_rx_summary = Some(format!("decode error: {err}"));
+                    state.needs_redraw = true;
                 }
             }
         }
 
-        if force_refresh || last_poll.elapsed() >= POLL_INTERVAL {
-            force_refresh = false;
+        if state.force_refresh || last_poll.elapsed() >= POLL_INTERVAL {
+            state.force_refresh = false;
             last_poll = Instant::now();
-            needs_redraw = true;
+            state.needs_redraw = true;
 
             match reader.poll() {
                 Ok(Some(snap)) => {
-                    last_poll_err = None;
+                    state.last_poll_err = None;
                     let track_id = snap.track_id();
-                    if last_track.as_ref() != Some(&track_id)
+                    if state.last_track.as_ref() != Some(&track_id)
                         && (!snap.title.trim().is_empty() || !snap.artist.trim().is_empty())
                     {
-                        if recent_tracks.len() == MAX_RECENT_TRACKS {
-                            recent_tracks.pop_back();
+                        if state.recent_tracks.len() == MAX_RECENT_TRACKS {
+                            state.recent_tracks.pop_back();
                         }
-                        recent_tracks.push_front(TrackEvent {
-                            elapsed: started.elapsed(),
+                        state.recent_tracks.push_front(TrackEvent {
+                            elapsed: state.started.elapsed(),
                             app: friendly_app_name(&snap.app_id),
                             title: display_or(&snap.title, "<untitled>"),
                             artist: display_or(&snap.artist, "<unknown artist>"),
                         });
-                        last_track = Some(track_id.clone());
+                        state.last_track = Some(track_id.clone());
 
                         if !snap.title.trim().is_empty() {
-                            current_lyrics = LyricsState::Loading;
+                            state.current_lyrics = LyricsState::Loading;
                             let duration_secs = if snap.duration.is_zero() {
                                 None
                             } else {
@@ -288,121 +422,277 @@ fn run_live_dashboard(reader: &mut SmtcReader, opts: &CliOptions) {
                                 duration_secs,
                             });
                         } else {
-                            current_lyrics = LyricsState::Idle;
+                            state.current_lyrics = LyricsState::Idle;
                         }
                     }
 
                     if let Ok(vol_opt) = audio.get_app_volume(&snap.app_id) {
-                        current_volume = vol_opt;
+                        state.current_volume = vol_opt;
                     }
-                    last_snap = Some(snap);
+                    state.last_snap = Some(snap);
                 }
                 Ok(None) => {
-                    last_poll_err = None;
-                    last_snap = None;
-                    current_volume = None;
+                    state.last_poll_err = None;
+                    state.last_snap = None;
+                    state.current_volume = None;
                     while worker.try_recv().is_some() {}
                 }
                 Err(err) => {
-                    last_poll_err = Some(err.to_string());
+                    state.last_poll_err = Some(err.to_string());
                 }
             }
         }
 
         while let Some(resp) = worker.try_recv() {
-            if last_track.as_ref() == Some(&resp.track_id) {
-                current_lyrics = resp.state;
-                needs_redraw = true;
+            if state.last_track.as_ref() == Some(&resp.track_id) {
+                state.current_lyrics = resp.state;
+                state.needs_redraw = true;
             }
         }
 
-        let show_overlay = volume_overlay_until.is_some_and(|until| Instant::now() < until);
-        if had_overlay && !show_overlay {
-            volume_overlay_until = None;
-            needs_redraw = true;
+        let show_overlay = state
+            .volume_overlay_until
+            .is_some_and(|until| Instant::now() < until);
+        if state.had_overlay && !show_overlay {
+            state.volume_overlay_until = None;
+            state.needs_redraw = true;
         }
-        had_overlay = show_overlay;
+        state.had_overlay = show_overlay;
 
-        if needs_redraw {
-            let mut frame = String::with_capacity(2400);
-            frame.push_str("\x1b[H\x1b[J");
-            frame.push_str(
-                "========================================================================\n",
-            );
-            frame.push_str(
-                "  Desk Media Companion  |  Phase 0, Milestone 0.3: Controls & Volume    \n",
-            );
-            frame.push_str(
-                "========================================================================\n\n",
-            );
+        let connected = transport.is_connected();
+        if connected && !was_connected {
+            sync_state.reset();
+            state.needs_redraw = true;
+        } else if !connected && was_connected {
+            state.needs_redraw = true;
+        }
+        was_connected = connected;
 
-            if let Some(err) = &last_poll_err {
-                frame.push_str(&format!("  SMTC poll warning (retrying): {err}\n"));
-            } else if let Some(snap) = &last_snap {
-                let app_label = friendly_app_name(&snap.app_id);
-                frame.push_str(&render_live_snapshot(snap, current_volume));
-                frame.push('\n');
-
-                let vol_info = current_volume.map(|v| OledVolumeInfo {
-                    app_label: &app_label,
-                    percent: v.percent,
-                    muted: v.muted,
-                    show_overlay,
-                });
-                frame.push_str(&render_lyrics_and_oled(
-                    snap,
-                    &current_lyrics,
-                    opts.offset_ms,
-                    vol_info.as_ref(),
-                ));
-            } else {
-                frame.push_str("  Status: [IDLE]\n\n");
-                frame.push_str("  Waiting for an active media session...\n");
-                frame.push_str(
-                    "  Start Spotify, spotifast, YouTube, or any Windows media player.\n",
-                );
+        if connected {
+            let (track_pkt, lyric_pkt, playback_pkt) = build_protocol_packets(
+                state.last_snap.as_ref(),
+                &state.current_lyrics,
+                state.current_volume,
+                show_overlay,
+                opts.offset_ms,
+            );
+            let mut outbound = sync_state.diff_packets(track_pkt, lyric_pkt, playback_pkt);
+            if let Some(power_pkt) = sync_state.diff_power(PowerMode::Awake) {
+                outbound.push(power_pkt);
             }
-
-            frame.push_str(
-                "\n------------------------------------------------------------------------\n",
-            );
-            if let Some((at, msg)) = &last_action_msg {
-                frame.push_str(&format!(
-                    "  Last Cmd: [+{}] {}\n",
-                    format_duration(*at),
-                    msg
-                ));
-            }
-            frame.push_str("  Recent Track Changes:\n");
-            if recent_tracks.is_empty() {
-                frame.push_str("    (none detected yet)\n");
-            } else {
-                for ev in &recent_tracks {
-                    let title = truncate_chars(&ev.title, 28);
-                    let artist = truncate_chars(&ev.artist, 22);
-                    frame.push_str(&format!(
-                        "    [+{}] {:<10} {} - {}\n",
-                        format_duration(ev.elapsed),
-                        ev.app,
-                        title,
-                        artist
-                    ));
+            for pkt in outbound {
+                let bytes = pkt.encode();
+                if transport.send_packet(&bytes).is_ok() {
+                    stats.tx_packets += 1;
+                    stats.tx_bytes += bytes.len() as u64;
+                    stats.last_tx_summary = Some(pkt.summary());
                 }
             }
+        }
 
-            frame.push_str(
-                "\n  Controls: [Left/P] Prev  [Space] Play/Pause  [Right/N] Next\n",
+        if state.needs_redraw {
+            let frame = render_dashboard_frame(
+                &state,
+                opts,
+                transport.as_ref(),
+                connected,
+                &stats,
+                show_overlay,
             );
-            frame.push_str(
-                "            [Up/Down] Vol +/-5%  [M] Mute  [Q] Quit\n",
-            );
-
             let _ = out.write_all(frame.as_bytes());
             let _ = out.flush();
         }
 
         thread::sleep(INPUT_TICK);
     }
+}
+
+fn build_protocol_packets(
+    snap_opt: Option<&MediaSnapshot>,
+    lyrics: &LyricsState,
+    volume: Option<AppVolumeState>,
+    show_overlay: bool,
+    offset_ms: i64,
+) -> (Option<HostPacket>, Option<HostPacket>, HostPacket) {
+    let Some(snap) = snap_opt else {
+        return (
+            None,
+            None,
+            HostPacket::PlaybackState {
+                is_playing: false,
+                is_muted: false,
+                show_volume_overlay: false,
+                has_session: false,
+                has_volume: false,
+                position_sec: 0,
+                duration_sec: 0,
+                volume_percent: 0,
+            },
+        );
+    };
+
+    let dur_sec = snap.duration.as_secs().min(u16::MAX as u64) as u16;
+    let pos_sec = snap.position.as_secs().min(u16::MAX as u64) as u16;
+    let track = HostPacket::TrackMeta {
+        duration_sec: dur_sec,
+        title: display_or(&snap.title, "<untitled>"),
+        artist: display_or(&snap.artist, "<unknown artist>"),
+        app: friendly_app_name(&snap.app_id),
+    };
+
+    let raw_ms = snap.position.as_millis().min(i64::MAX as u128) as i64;
+    let effective_pos_ms = raw_ms.saturating_add(offset_ms).max(0) as u64;
+
+    let lyric = match lyrics {
+        LyricsState::Idle => HostPacket::LyricLine {
+            mode: LyricDisplayMode::NotFound,
+            text: String::new(),
+        },
+        LyricsState::Loading => HostPacket::LyricLine {
+            mode: LyricDisplayMode::Loading,
+            text: String::new(),
+        },
+        LyricsState::Error(_) => HostPacket::LyricLine {
+            mode: LyricDisplayMode::Error,
+            text: String::new(),
+        },
+        LyricsState::Ready { content, .. } => match content {
+            LyricsContent::Synced(lines) => {
+                let active = active_lyric(lines, effective_pos_ms);
+                match active.current {
+                    None => HostPacket::LyricLine {
+                        mode: LyricDisplayMode::Intro,
+                        text: active
+                            .next
+                            .map(|l| l.text.trim().to_string())
+                            .unwrap_or_default(),
+                    },
+                    Some(line) if line.text.trim().is_empty() => HostPacket::LyricLine {
+                        mode: LyricDisplayMode::Break,
+                        text: String::new(),
+                    },
+                    Some(line) => HostPacket::LyricLine {
+                        mode: LyricDisplayMode::SyncedText,
+                        text: line.text.trim().to_string(),
+                    },
+                }
+            }
+            LyricsContent::Instrumental => HostPacket::LyricLine {
+                mode: LyricDisplayMode::Instrumental,
+                text: String::new(),
+            },
+            LyricsContent::PlainOnly(_) => HostPacket::LyricLine {
+                mode: LyricDisplayMode::PlainOnly,
+                text: String::new(),
+            },
+            LyricsContent::NotFound => HostPacket::LyricLine {
+                mode: LyricDisplayMode::NotFound,
+                text: String::new(),
+            },
+        },
+    };
+
+    let playback = HostPacket::PlaybackState {
+        is_playing: snap.status.is_playing(),
+        is_muted: volume.is_some_and(|v| v.muted),
+        show_volume_overlay: show_overlay && volume.is_some(),
+        has_session: true,
+        has_volume: volume.is_some(),
+        position_sec: pos_sec,
+        duration_sec: dur_sec,
+        volume_percent: volume.map(|v| v.percent).unwrap_or(0),
+    };
+
+    (Some(track), Some(lyric), playback)
+}
+
+fn render_dashboard_frame(
+    state: &DashboardState,
+    opts: &CliOptions,
+    transport: &dyn DeviceTransport,
+    connected: bool,
+    stats: &TransportStats,
+    show_overlay: bool,
+) -> String {
+    let mut frame = String::with_capacity(2800);
+    frame.push_str("\x1b[H\x1b[J");
+    frame.push_str("========================================================================\n");
+    frame.push_str("  Desk Media Companion  |  Phase 0, Milestone 0.4: BLE Protocol & Sim   \n");
+    frame.push_str("========================================================================\n\n");
+
+    if let Some(err) = &state.last_poll_err {
+        frame.push_str(&format!("  SMTC poll warning (retrying): {err}\n"));
+    } else if let Some(snap) = &state.last_snap {
+        let app_label = friendly_app_name(&snap.app_id);
+        frame.push_str(&render_live_snapshot(snap, state.current_volume));
+        frame.push('\n');
+
+        let vol_info = state.current_volume.map(|v| OledVolumeInfo {
+            app_label: &app_label,
+            percent: v.percent,
+            muted: v.muted,
+            show_overlay,
+        });
+        frame.push_str(&render_lyrics_and_oled(
+            snap,
+            &state.current_lyrics,
+            opts.offset_ms,
+            vol_info.as_ref(),
+        ));
+    } else {
+        frame.push_str("  Status: [IDLE]\n\n");
+        frame.push_str("  Waiting for an active media session...\n");
+        frame.push_str("  Start Spotify, YouTube, or any Windows media player.\n");
+    }
+
+    frame.push_str("\n------------------------------------------------------------------------\n");
+    if opts.simulate {
+        let link_badge = if connected {
+            "[CONNECTED]"
+        } else {
+            "[OPEN IN BROWSER]"
+        };
+        frame.push_str(&format!(
+            "  Link:     {}  {}  |  TX: {} pkts ({} B)  RX: {} pkts\n",
+            transport.label(),
+            link_badge,
+            stats.tx_packets,
+            stats.tx_bytes,
+            stats.rx_packets
+        ));
+    } else {
+        frame.push_str(
+            "  Link:     Local terminal only (run with --simulate for 128x64 pixel UI)\n",
+        );
+    }
+
+    if let Some((at, msg)) = &state.last_action_msg {
+        frame.push_str(&format!(
+            "  Last Cmd: [+{}] {}\n",
+            format_duration(*at),
+            msg
+        ));
+    }
+    frame.push_str("  Recent Track Changes:\n");
+    if state.recent_tracks.is_empty() {
+        frame.push_str("    (none detected yet)\n");
+    } else {
+        for ev in &state.recent_tracks {
+            let title = truncate_chars(&ev.title, 28);
+            let artist = truncate_chars(&ev.artist, 22);
+            frame.push_str(&format!(
+                "    [+{}] {:<10} {} - {}\n",
+                format_duration(ev.elapsed),
+                ev.app,
+                title,
+                artist
+            ));
+        }
+    }
+
+    frame.push_str("\n  Controls: [Left/P] Prev  [Space] Play/Pause  [Right/N] Next\n");
+    frame.push_str("            [Up/Down] Vol +/-5%  [M] Mute  [Q] Quit\n");
+    frame
 }
 
 fn send_media_action(reader: &SmtcReader, cmd: MediaCommand, label: &str) -> String {
@@ -603,5 +893,30 @@ fn display_or<'a>(value: &'a str, fallback: &'a str) -> String {
         fallback.to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_simulate_and_port_flags() {
+        let opts = parse_args(vec![
+            "--simulate".to_string(),
+            "--port".to_string(),
+            "8080".to_string(),
+            "--offset-ms=-250".to_string(),
+            "--no-cache".to_string(),
+        ])
+        .unwrap();
+
+        assert!(opts.simulate);
+        assert_eq!(opts.port, 8080);
+        assert_eq!(opts.offset_ms, -250);
+        assert!(opts.no_cache);
+
+        assert!(parse_args(vec!["--port=0".to_string()]).is_err());
+        assert!(parse_args(vec!["--port=abc".to_string()]).is_err());
     }
 }

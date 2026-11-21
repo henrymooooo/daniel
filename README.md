@@ -43,8 +43,8 @@ All 8 signal lines use the XIAO ESP32-C3's 8 non-strapping GPIOs, leaving the bo
 
 - Milestone 0.1 (done): Windows SMTC (`Windows.Media.Control`) media reader, playback timestamp interpolation, and live terminal dashboard.
 - Milestone 0.2 (done): LRCLIB (`lrclib.net`) `.lrc` synced lyrics fetcher, parser, local cache, and `128×64` OLED layout preview.
-- Milestone 0.3 (current): Media controls (Prev, Play/Pause, Next), per-app WASAPI volume and mute control, and OLED volume display.
-- Milestone 0.4: BLE GATT service protocol and digital simulator for the ESP32-C3.
+- Milestone 0.3 (done): Media controls (Prev, Play/Pause, Next), per-app WASAPI volume and mute control, and OLED volume display.
+- Milestone 0.4 (current): BLE GATT binary protocol and pixel-accurate `128×64` web simulator for the ESP32-C3.
 
 ### Phase 1: USB breadboard test
 
@@ -60,14 +60,18 @@ Solder the 3 Outemu Brown switches and the 2000mAh LiPo (`BAT+`/`BAT-`), then tu
 
 ## Quick start
 
-Start Spotify, spotifast, YouTube, or another media app on Windows 11, then run:
+Start Spotify, YouTube, or another media app on Windows 11, then run the companion with the `128×64` browser simulator:
 
 ```powershell
-cargo run --manifest-path companion/Cargo.toml
+cargo run --manifest-path companion/Cargo.toml -- --simulate
 ```
+
+Then open `http://127.0.0.1:47291` in your browser to interact with the simulated OLED screen, keycaps, and EC11 knob.
 
 Optional flags:
 
+- `--simulate`: starts the local `128×64` web simulator over the BLE binary protocol.
+- `--port 47291`: overrides the simulator HTTP port.
 - `--once`: prints one SMTC snapshot and exits.
 - `--offset-ms 250`: shifts lyric timing in milliseconds (positive values show lines earlier).
 - `--no-cache`: bypasses the local disk cache and queries `lrclib.net` directly.
