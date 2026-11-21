@@ -1,0 +1,12 @@
+[package]
+name = "desk-media-companion"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Media_Control",
+    "Win32_System_Com",
+] }

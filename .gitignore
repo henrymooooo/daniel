@@ -1,0 +1,12 @@
+# Rust companion build artifacts
+/companion/target/
+*.exe
+*.pdb
+
+# Firmware build artifacts (PlatformIO / Arduino)
+/firmware/.pio/
+/firmware/build/
+
+# OS / Editor metadata
+.DS_Store
+Thumbs.db
