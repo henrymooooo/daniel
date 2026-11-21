@@ -1,8 +1,19 @@
+use std::time::Duration;
+
 use crate::format::{format_duration, render_progress_bar, truncate_chars};
 use crate::media::{MediaSnapshot, PlaybackStatus};
 
 /// 21 monospace 6px-wide glyphs fit comfortably across a 128px-wide SH1106 OLED (21 * 6 = 126px).
 pub const OLED_COLS: usize = 21;
+
+/// Live app volume state shown on the artist row (and optionally as a 1.5s pop-up overlay).
+#[derive(Debug, Clone, Copy)]
+pub struct OledVolumeInfo<'a> {
+    pub app_label: &'a str,
+    pub percent: u8,
+    pub muted: bool,
+    pub show_overlay: bool,
+}
 
 /// Lyric area state passed into the `128×64` OLED layout preview.
 pub enum OledLyricStatus<'a> {
@@ -136,8 +147,32 @@ fn pad_to_cols(s: &str, cols: usize) -> String {
     }
 }
 
+fn left_right_row(left: &str, right: &str, cols: usize) -> String {
+    let right_len = right.chars().count();
+    if right_len >= cols {
+        return pad_to_cols(right, cols);
+    }
+    let max_left = cols.saturating_sub(right_len + 1);
+    let left_clipped = truncate_chars(left, max_left);
+    let left_len = left_clipped.chars().count();
+    let gap = cols - left_len - right_len;
+    format!("{left_clipped}{}{right}", " ".repeat(gap))
+}
+
+fn volume_badge(v: &OledVolumeInfo<'_>) -> String {
+    if v.muted {
+        "MUTE".to_string()
+    } else {
+        format!("{}%", v.percent)
+    }
+}
+
 /// Renders an 8-row boxed text preview simulating the 1.3" `128×64` SH1106 OLED screen.
-pub fn render_oled_box(snap: &MediaSnapshot, lyric: &OledLyricStatus<'_>) -> Vec<String> {
+pub fn render_oled_box(
+    snap: &MediaSnapshot,
+    lyric: &OledLyricStatus<'_>,
+    volume: Option<&OledVolumeInfo<'_>>,
+) -> Vec<String> {
     let icon = match snap.status {
         PlaybackStatus::Playing => "> ",
         PlaybackStatus::Paused => "|| ",
@@ -156,51 +191,74 @@ pub fn render_oled_box(snap: &MediaSnapshot, lyric: &OledLyricStatus<'_>) -> Vec
     };
 
     let row0 = pad_to_cols(&format!("{icon}{title_raw}"), OLED_COLS);
-    let row1 = pad_to_cols(artist_raw, OLED_COLS);
+    let row1 = match volume {
+        Some(v) => left_right_row(artist_raw, &volume_badge(v), OLED_COLS),
+        None => pad_to_cols(artist_raw, OLED_COLS),
+    };
     let row2 = "-".repeat(OLED_COLS);
 
-    let mut lyric_rows: Vec<String> = match lyric {
-        OledLyricStatus::Loading => vec![
-            String::new(),
-            "  Loading lyrics...".to_string(),
-            String::new(),
-        ],
-        OledLyricStatus::SyncedLine(text) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                vec![String::new(), "        ~ ~ ~".to_string(), String::new()]
-            } else {
-                wrap_words(trimmed, OLED_COLS, 3)
+    let mut lyric_rows: Vec<String> = if let Some(v) = volume.filter(|v| v.show_overlay) {
+        let header = left_right_row(
+            &format!("Vol {}", v.app_label),
+            &volume_badge(v),
+            OLED_COLS,
+        );
+        let pct = if v.muted { 0 } else { v.percent as u64 };
+        let bar = render_progress_bar(
+            Duration::from_secs(pct),
+            Duration::from_secs(100),
+            OLED_COLS - 2,
+        );
+        let footer = if v.muted {
+            "       (muted)".to_string()
+        } else {
+            String::new()
+        };
+        vec![header, bar, footer]
+    } else {
+        match lyric {
+            OledLyricStatus::Loading => vec![
+                String::new(),
+                "  Loading lyrics...".to_string(),
+                String::new(),
+            ],
+            OledLyricStatus::SyncedLine(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    vec![String::new(), "        ~ ~ ~".to_string(), String::new()]
+                } else {
+                    wrap_words(trimmed, OLED_COLS, 3)
+                }
             }
+            OledLyricStatus::Intro { next } => match next.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(upcoming) => {
+                    let mut rows = vec!["Next:".to_string()];
+                    rows.extend(wrap_words(upcoming, OLED_COLS, 2));
+                    rows
+                }
+                None => vec![String::new(), "       (intro)".to_string(), String::new()],
+            },
+            OledLyricStatus::Instrumental => vec![
+                String::new(),
+                "  ~ Instrumental ~".to_string(),
+                String::new(),
+            ],
+            OledLyricStatus::PlainOnly => vec![
+                String::new(),
+                " (plain lyrics only)".to_string(),
+                String::new(),
+            ],
+            OledLyricStatus::NotFound => vec![
+                String::new(),
+                "  (no synced lyrics)".to_string(),
+                String::new(),
+            ],
+            OledLyricStatus::Error => vec![
+                String::new(),
+                " (lyrics unavailable)".to_string(),
+                String::new(),
+            ],
         }
-        OledLyricStatus::Intro { next } => match next.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(upcoming) => {
-                let mut rows = vec!["Next:".to_string()];
-                rows.extend(wrap_words(upcoming, OLED_COLS, 2));
-                rows
-            }
-            None => vec![String::new(), "       (intro)".to_string(), String::new()],
-        },
-        OledLyricStatus::Instrumental => vec![
-            String::new(),
-            "  ~ Instrumental ~".to_string(),
-            String::new(),
-        ],
-        OledLyricStatus::PlainOnly => vec![
-            String::new(),
-            " (plain lyrics only)".to_string(),
-            String::new(),
-        ],
-        OledLyricStatus::NotFound => vec![
-            String::new(),
-            "  (no synced lyrics)".to_string(),
-            String::new(),
-        ],
-        OledLyricStatus::Error => vec![
-            String::new(),
-            " (lyrics unavailable)".to_string(),
-            String::new(),
-        ],
     };
 
     while lyric_rows.len() < 3 {
@@ -292,6 +350,7 @@ mod tests {
         let normal = render_oled_box(
             &sample_snap(18, 224),
             &OledLyricStatus::SyncedLine("I'm just happy right now"),
+            None,
         );
         assert_eq!(normal.len(), 9);
         assert!(normal.iter().all(|row| row.chars().count() == OLED_COLS + 2));
@@ -301,8 +360,45 @@ mod tests {
             &OledLyricStatus::Intro {
                 next: Some("Opening line coming soon"),
             },
+            None,
         );
         assert_eq!(hour_long.len(), 9);
         assert!(hour_long.iter().all(|row| row.chars().count() == OLED_COLS + 2));
+    }
+
+    #[test]
+    fn oled_box_shows_right_aligned_volume_and_popup_overlay() {
+        let with_vol = render_oled_box(
+            &sample_snap(18, 224),
+            &OledLyricStatus::SyncedLine("I'm just happy right now"),
+            Some(&OledVolumeInfo {
+                app_label: "spotifast",
+                percent: 75,
+                muted: false,
+                show_overlay: false,
+            }),
+        );
+        assert_eq!(with_vol.len(), 9);
+        assert!(with_vol.iter().all(|row| row.chars().count() == OLED_COLS + 2));
+        assert!(with_vol[2].ends_with(" 75%|"));
+        assert!(with_vol[4].contains("I'm just happy"));
+
+        let muted_overlay = render_oled_box(
+            &sample_snap(18, 224),
+            &OledLyricStatus::SyncedLine("I'm just happy right now"),
+            Some(&OledVolumeInfo {
+                app_label: "spotifast",
+                percent: 100,
+                muted: true,
+                show_overlay: true,
+            }),
+        );
+        assert_eq!(muted_overlay.len(), 9);
+        assert!(muted_overlay.iter().all(|row| row.chars().count() == OLED_COLS + 2));
+        assert!(muted_overlay[2].ends_with("MUTE|"));
+        assert!(muted_overlay[4].contains("Vol spotifast"));
+        assert!(muted_overlay[4].contains("MUTE"));
+        assert!(muted_overlay[5].starts_with("|["));
+        assert!(muted_overlay[6].contains("(muted)"));
     }
 }

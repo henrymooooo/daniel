@@ -167,6 +167,14 @@ pub fn compute_live_position(
     (live_pos, duration)
 }
 
+/// Transport commands dispatched to the active Windows SMTC media session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaCommand {
+    Prev,
+    PlayPause,
+    Next,
+}
+
 /// Polls Windows Global System Media Transport Controls (SMTC) for the active media session.
 pub struct SmtcReader {
     manager: GlobalSystemMediaTransportControlsSessionManager,
@@ -188,8 +196,23 @@ impl SmtcReader {
         })
     }
 
-    /// Reads the best active SMTC session (preferring a currently playing session) and returns a live snapshot.
-    pub fn poll(&mut self) -> WinResult<Option<MediaSnapshot>> {
+    /// Sends a media transport command (Prev / PlayPause / Next) to the active SMTC session.
+    pub fn send_command(&self, cmd: MediaCommand) -> WinResult<bool> {
+        let (selected, _) = self.select_session()?;
+        let Some(session) = selected else {
+            return Ok(false);
+        };
+
+        match cmd {
+            MediaCommand::Prev => session.TrySkipPreviousAsync()?.get(),
+            MediaCommand::PlayPause => session.TryTogglePlayPauseAsync()?.get(),
+            MediaCommand::Next => session.TrySkipNextAsync()?.get(),
+        }
+    }
+
+    fn select_session(
+        &self,
+    ) -> WinResult<(Option<GlobalSystemMediaTransportControlsSession>, usize)> {
         let sessions = self.manager.GetSessions()?;
         let session_count_u32 = sessions.Size()?;
         let session_count = session_count_u32 as usize;
@@ -198,7 +221,12 @@ impl SmtcReader {
             .filter_map(|idx| sessions.GetAt(idx).ok())
             .collect();
 
-        let selected = pick_preferred_session(current, &sessions_vec);
+        Ok((pick_preferred_session(current, &sessions_vec), session_count))
+    }
+
+    /// Reads the best active SMTC session (preferring a currently playing session) and returns a live snapshot.
+    pub fn poll(&mut self) -> WinResult<Option<MediaSnapshot>> {
+        let (selected, session_count) = self.select_session()?;
         let Some(session) = selected else {
             self.fallback_anchor = None;
             return Ok(None);
